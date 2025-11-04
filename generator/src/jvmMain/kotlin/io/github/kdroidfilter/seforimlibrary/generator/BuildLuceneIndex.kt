@@ -19,6 +19,7 @@ import org.apache.lucene.analysis.TokenStream
 import org.apache.lucene.analysis.core.LowerCaseFilter
 import org.apache.lucene.analysis.miscellaneous.PerFieldAnalyzerWrapper
 import org.apache.lucene.analysis.ngram.NGramTokenFilter
+import io.github.kdroidfilter.seforimlibrary.analysis.hebrew.SefariaHebrewAnalyzer
 import org.jsoup.Jsoup
 import org.jsoup.safety.Safelist
 import java.io.File
@@ -93,8 +94,8 @@ fun main() = runBlocking {
         }
     }
 
-    // Use Lucene's StandardAnalyzer by default; add per-field 4-gram analyzer for substring search
-    val defaultAnalyzer = StandardAnalyzer()
+    // Text index analyzer (Hebrew-aware, with 4-gram per-field for substring search)
+    val defaultTextAnalyzer: Analyzer = SefariaHebrewAnalyzer()
     val ngram4Analyzer = object : Analyzer() {
         override fun createComponents(fieldName: String): TokenStreamComponents {
             val src = org.apache.lucene.analysis.standard.StandardTokenizer()
@@ -104,20 +105,22 @@ fun main() = runBlocking {
             return TokenStreamComponents(src, ts)
         }
     }
-    val analyzer = PerFieldAnalyzerWrapper(
-        defaultAnalyzer,
+    val textAnalyzer = PerFieldAnalyzerWrapper(
+        defaultTextAnalyzer,
         mapOf(
             LuceneTextIndexWriter.FIELD_TEXT_NG4 to ngram4Analyzer
         )
     )
+    // Lookup index analyzer (book names, acronyms, toc) — keep simple and avoid Sefaria tokenizer
+    val lookupAnalyzer: Analyzer = StandardAnalyzer()
 
-    LuceneTextIndexWriter(indexDir, analyzer = analyzer).use { writer ->
-        LuceneLookupIndexWriter(lookupDir, analyzer = analyzer).use { lookup ->
+    LuceneTextIndexWriter(indexDir, analyzer = textAnalyzer).use { writer ->
+        LuceneLookupIndexWriter(lookupDir, analyzer = lookupAnalyzer).use { lookup ->
             val books = repo.getAllBooks()
             val indexThreads = (System.getProperty("indexThreads") ?: Runtime.getRuntime().availableProcessors().toString()).toInt().coerceAtLeast(1)
             val workerDispatcher = Dispatchers.Default.limitedParallelism(indexThreads)
             val totalBooks = books.size
-            logger.i { "Indexing $totalBooks books into $indexDir using StandardAnalyzer + 4-gram field" }
+            logger.i { "Indexing $totalBooks books into $indexDir using SefariaHebrewAnalyzer + 4-gram field" }
             val progress = java.util.concurrent.atomic.AtomicInteger(0)
 
             books.map { book ->

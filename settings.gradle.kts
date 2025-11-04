@@ -31,4 +31,5 @@ dependencyResolutionManagement {
 include(":core")
 include(":dao")
 include(":generator")
+include(":analysis")
 include(":sample:composeApp")

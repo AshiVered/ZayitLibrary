@@ -31,6 +31,7 @@ kotlin {
         jvmMain.dependencies {
             implementation(libs.kotlinx.coroutines.swing)
             implementation(libs.sqlDelight.driver.sqlite)
+            implementation(project(":analysis"))
             implementation(libs.lucene.core)
             implementation(libs.lucene.analysis.common)
             implementation(libs.lucene.queryparser)
