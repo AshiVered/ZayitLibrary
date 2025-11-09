@@ -28,7 +28,7 @@ class SeforimRepository(databasePath: String, private val driver: SqlDriver) {
     init {
 
         logger.d{"Initializing SeforimRepository"}
-        // Create the database schema if it doesn't exist
+        // Create the database schema (fresh builds only; no runtime migrations needed)
         SeforimDb.Schema.create(driver)
         // SQLite optimizations
         driver.execute(null, "PRAGMA journal_mode=WAL", 0)
@@ -44,6 +44,8 @@ class SeforimRepository(databasePath: String, private val driver: SqlDriver) {
             logger.d{"Error counting books: ${e.message}"}
         }
     }
+
+    
 
     // --- Line ⇄ TOC mapping ---
 
@@ -722,10 +724,13 @@ class SeforimRepository(databasePath: String, private val driver: SqlDriver) {
             database.bookQueriesQueries.insertWithId(
                 id = book.id,
                 categoryId = book.categoryId,
+                sourceId = book.sourceId,
                 title = book.title,
                 heShortDesc = book.heShortDesc,
+                notesContent = book.notesContent,
                 orderIndex = book.order.toLong(),
-                totalLines = book.totalLines.toLong()
+                totalLines = book.totalLines.toLong(),
+                isBaseBook = if (book.isBaseBook) 1 else 0
             )
             logger.d{"Used insertWithId for book '${book.title}' with ID: ${book.id} and categoryId: ${book.categoryId}"}
 
@@ -772,10 +777,13 @@ class SeforimRepository(databasePath: String, private val driver: SqlDriver) {
             // Fall back to auto-generated ID if book.id is 0
             database.bookQueriesQueries.insert(
                 categoryId = book.categoryId,
+                sourceId = book.sourceId,
                 title = book.title,
                 heShortDesc = book.heShortDesc,
+                notesContent = book.notesContent,
                 orderIndex = book.order.toLong(),
-                totalLines = book.totalLines.toLong()
+                totalLines = book.totalLines.toLong(),
+                isBaseBook = if (book.isBaseBook) 1 else 0
             )
             val id = database.bookQueriesQueries.lastInsertRowId().executeAsOne()
             logger.d{"Used insert for book '${book.title}', got ID: $id with categoryId: ${book.categoryId}"}
@@ -822,6 +830,34 @@ class SeforimRepository(databasePath: String, private val driver: SqlDriver) {
 
             return@withContext id
         }
+    }
+
+    // --- Sources ---
+
+    /**
+     * Returns a Source by name, or null if not found.
+     */
+    suspend fun getSourceByName(name: String): Source? = withContext(Dispatchers.IO) {
+        database.sourceQueriesQueries.selectByName(name).executeAsOneOrNull()?.toModel()
+    }
+
+    /**
+     * Inserts a source if missing and returns its id.
+     */
+    suspend fun insertSource(name: String): Long = withContext(Dispatchers.IO) {
+        // Check existing
+        val existing = database.sourceQueriesQueries.selectByName(name).executeAsOneOrNull()
+        if (existing != null) return@withContext existing.id
+
+        database.sourceQueriesQueries.insert(name)
+        val id = database.sourceQueriesQueries.lastInsertRowId().executeAsOne()
+        if (id == 0L) {
+            // Try to read back just in case
+            val again = database.sourceQueriesQueries.selectByName(name).executeAsOneOrNull()
+            if (again != null) return@withContext again.id
+            throw RuntimeException("Failed to insert source '$name'")
+        }
+        id
     }
 
     suspend fun updateBookTotalLines(bookId: Long, totalLines: Int) = withContext(Dispatchers.IO) {
@@ -1613,6 +1649,13 @@ class SeforimRepository(databasePath: String, private val driver: SqlDriver) {
             val pubDates = getBookPubDates(bookData.id)
             bookData.toModel(json, authors, pubPlaces, pubDates).copy(topics = topics)
         }
+    }
+
+    /**
+     * Returns the IDs of all base books (isBaseBook = 1).
+     */
+    suspend fun getBaseBookIds(): List<Long> = withContext(Dispatchers.IO) {
+        database.bookQueriesQueries.selectBaseIds().executeAsList()
     }
 
     /**

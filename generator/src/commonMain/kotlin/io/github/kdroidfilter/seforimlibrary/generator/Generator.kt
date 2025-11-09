@@ -55,6 +55,14 @@ class DatabaseGenerator(
     // Library root used for relative path normalization
     private lateinit var libraryRoot: Path
 
+    // Map from library-relative book key (e.g. "תנ"ך/בראשית.txt") to source name (e.g. "sefariaToOtzaria")
+    private val manifestSourcesByRel = mutableMapOf<String, String>()
+    // Cache of source name -> id from DB
+    private val sourceNameToId = mutableMapOf<String, Long>()
+
+    // Source blacklist loaded from resources (fallback to default)
+    private val sourceBlacklist: Set<String> = loadSourceBlacklistFromResources()
+
     // In-memory caches to accelerate link processing using available RAM
     private var booksByTitle: Map<String, Book> = emptyMap()
     private var booksById: Map<Long, Book> = emptyMap()
@@ -97,6 +105,10 @@ class DatabaseGenerator(
                 val metadata = loadMetadata()
                 logger.i { "Metadata loaded: ${metadata.size} entries" }
 
+                // Load sources from files_manifest.json and upsert source table
+                loadSourcesFromManifest()
+                precreateSourceEntries()
+
                 // Process hierarchy
                 val libraryPath = sourceDirectory.resolve("אוצריא")
                 if (!libraryPath.exists()) {
@@ -109,7 +121,10 @@ class DatabaseGenerator(
                 // Estimate total number of books (txt files) for progress tracking
                 totalBooksToProcess = try {
                     Files.walk(libraryRoot).use { s ->
-                        s.filter { Files.isRegularFile(it) && it.extension == "txt" }.count().toInt()
+                        s.filter { Files.isRegularFile(it) && it.extension == "txt" }
+                            .filter { !it.fileName.toString().substringBeforeLast('.')
+                                .startsWith("הערות על ") }
+                            .count().toInt()
                     }
                 } catch (_: Exception) { 0 }
                 logger.i { "Planned to process approximately $totalBooksToProcess books" }
@@ -182,6 +197,9 @@ class DatabaseGenerator(
 
             repository.runInTransaction {
                 val metadata = loadMetadata()
+                // Load sources and create entries upfront
+                loadSourcesFromManifest()
+                precreateSourceEntries()
                 val libraryPath = sourceDirectory.resolve("אוצריא")
                 if (!libraryPath.exists()) {
                     throw IllegalStateException("The directory אוצריא does not exist in $sourceDirectory")
@@ -190,7 +208,10 @@ class DatabaseGenerator(
 
                 totalBooksToProcess = try {
                     Files.walk(libraryRoot).use { s ->
-                        s.filter { Files.isRegularFile(it) && it.extension == "txt" }.count().toInt()
+                        s.filter { Files.isRegularFile(it) && it.extension == "txt" }
+                            .filter { !it.fileName.toString().substringBeforeLast('.')
+                                .startsWith("הערות על ") }
+                            .count().toInt()
                     }
                 } catch (_: Exception) { 0 }
                 logger.i { "Planned to process approximately $totalBooksToProcess books (phase 1)" }
@@ -273,7 +294,21 @@ class DatabaseGenerator(
         if (bookContentCache.isNotEmpty()) return
         logger.i { "Preloading book contents into RAM from $libraryPath ..." }
         val files = Files.walk(libraryPath).use { s ->
-            s.filter { Files.isRegularFile(it) && it.extension == "txt" }.toList()
+            s.filter { Files.isRegularFile(it) && it.extension == "txt" }
+                .filter { p ->
+                    // Skip notes files
+                    val name = p.fileName.toString().substringBeforeLast('.')
+                    if (name.startsWith("הערות על ")) return@filter false
+                    // Skip blacklisted sources when known
+                    val rel = runCatching { toLibraryRelativeKey(p) }.getOrElse { p.fileName.toString() }
+                    val src = manifestSourcesByRel[rel] ?: "Unknown"
+                    if (sourceBlacklist.contains(src)) {
+                        logger.d { "Skipping preload for blacklisted source '$src': $rel" }
+                        return@filter false
+                    }
+                    true
+                }
+                .toList()
         }
         // Parallelize reads
         val loaded = coroutineScope {
@@ -320,6 +355,68 @@ class DatabaseGenerator(
         }
     }
 
+    @Serializable
+    private data class ManifestEntry(
+        val hash: String? = null
+    )
+
+    /**
+     * Loads `files_manifest.json` and builds a mapping from library-relative path
+     * (under אוצריא) to a source name (top-level directory of the manifest entry).
+     */
+    private suspend fun loadSourcesFromManifest() {
+        manifestSourcesByRel.clear()
+        // Prefer manifest in the provided source directory; fallback to repo path if present
+        val primary = sourceDirectory.resolve("files_manifest.json")
+        val fallback = Paths.get("otzaria-library/files_manifest.json")
+        val manifestPath = when {
+            primary.exists() -> primary
+            fallback.exists() -> fallback
+            else -> null
+        }
+        if (manifestPath == null) {
+            logger.w { "files_manifest.json not found; assigning source 'Unknown' to all books" }
+            return
+        }
+        runCatching {
+            val content = manifestPath.readText()
+            val map = json.decodeFromString<Map<String, ManifestEntry>>(content)
+            // For every manifest key, if it contains "/אוצריא/", index the subpath after it
+            for ((path, _) in map) {
+                val parts = path.split('/')
+                if (parts.isEmpty()) continue
+                val sourceName = parts.first()
+                val idx = parts.indexOf("אוצריא")
+                if (idx < 0 || idx == parts.size - 1) continue
+                val rel = parts.drop(idx + 1).joinToString("/")
+                // Keep first assignment, warn on duplicates
+                val prev = manifestSourcesByRel.putIfAbsent(rel, sourceName)
+                if (prev != null && prev != sourceName) {
+                    logger.w { "Duplicate source mapping for '$rel': existing=$prev new=$sourceName; keeping existing" }
+                }
+            }
+            logger.i { "Loaded ${manifestSourcesByRel.size} book→source mappings from manifest" }
+        }.onFailure { e ->
+            logger.w(e) { "Failed to parse files_manifest.json; sources will be 'Unknown'" }
+        }
+    }
+
+    /**
+     * Ensure all known source names from manifest are present in DB, including 'Unknown'.
+     */
+    private suspend fun precreateSourceEntries() {
+        // Always ensure 'Unknown' exists
+        val unknownId = repository.insertSource("Unknown")
+        sourceNameToId["Unknown"] = unknownId
+        // Insert all discovered sources
+        val uniqueSources = manifestSourcesByRel.values.toSet()
+        for (name in uniqueSources) {
+            val id = repository.insertSource(name)
+            sourceNameToId[name] = id
+        }
+        logger.i { "Prepared ${sourceNameToId.size} sources in DB" }
+    }
+
 
     /**
      * Processes a directory recursively, creating categories and books.
@@ -358,6 +455,13 @@ class DatabaseGenerator(
                         val key = toLibraryRelativeKey(entry)
                         if (processedPriorityBookKeys.contains(key)) {
                             logger.i { "⏭️ Skipping already-processed priority book: $key" }
+                            continue
+                        }
+                        // Skip companion notes files named 'הערות על <title>.txt'.
+                        val fname = entry.fileName.toString()
+                        val titleNoExt = fname.substringBeforeLast('.')
+                        if (titleNoExt.startsWith("הערות על ")) {
+                            logger.i { "📝 Skipping notes file '$fname' (will be attached to base book if present)" }
                             continue
                         }
                         if (parentCategoryId == null) {
@@ -425,13 +529,24 @@ class DatabaseGenerator(
     private suspend fun createAndProcessBook(
         path: Path,
         categoryId: Long,
-        metadata: Map<String, BookMetadata>
+        metadata: Map<String, BookMetadata>,
+        isBaseBook: Boolean = false
     ) {
         val filename = path.fileName.toString()
         val title = filename.substringBeforeLast('.')
         val meta = metadata[title]
 
         logger.i { "Processing book: $title with categoryId: $categoryId" }
+
+        // Apply source blacklist
+        val srcName = getSourceNameFor(path)
+        if (sourceBlacklist.contains(srcName)) {
+            logger.i { "⛔ Skipping '$title' from blacklisted source '$srcName'" }
+            processedBooksCount += 1
+            val pct = if (totalBooksToProcess > 0) (processedBooksCount * 100 / totalBooksToProcess) else 0
+            logger.i { "Books progress: $processedBooksCount/$totalBooksToProcess (${pct}%)" }
+            return
+        }
 
         // Assign a unique ID to this book
         val currentBookId = nextBookId++
@@ -452,16 +567,33 @@ class DatabaseGenerator(
             listOf(PubDate(date = pubDateValue))
         } ?: emptyList()
 
+        // Detect companion notes file named 'הערות על <title>.txt' in the same directory
+        val notesContent: String? = runCatching {
+            val dir = path.parent
+            val notesTitle = "הערות על $title"
+            val candidate = dir.resolve("$notesTitle.txt")
+            if (Files.isRegularFile(candidate)) {
+                // Prefer preloaded cache if available
+                val key = toLibraryRelativeKey(candidate)
+                val lines = bookContentCache[key]
+                if (lines != null) lines.joinToString("\n") else candidate.readText(Charsets.UTF_8)
+            } else null
+        }.getOrNull()
+
+        val sourceId = resolveSourceIdFor(path)
         val book = Book(
             id = currentBookId,
             categoryId = categoryId,
+            sourceId = sourceId,
             title = title,
             authors = authors,
             pubPlaces = pubPlaces,
             pubDates = pubDates,
             heShortDesc = meta?.heShortDesc,
+            notesContent = notesContent,
             order = meta?.order ?: 999f,
-            topics = extractTopics(path)
+            topics = extractTopics(path),
+            isBaseBook = isBaseBook
         )
 
         logger.d { "Inserting book '${book.title}' with ID: ${book.id} and categoryId: ${book.categoryId}" }
@@ -824,6 +956,11 @@ class DatabaseGenerator(
             // Last part is the book filename, everything before are categories
             val categories = if (parts.size > 1) parts.dropLast(1) else emptyList()
             val bookFileName = parts.last()
+            // Skip notes-only entries from priority list
+            if (bookFileName.substringBeforeLast('.').startsWith("הערות על ")) {
+                logger.i { "⏭️ Skipping notes file in priority list: $bookFileName" }
+                continue@outer
+            }
 
             // Fold into actual filesystem path
             var currentPath = libraryRoot
@@ -858,7 +995,7 @@ class DatabaseGenerator(
             }
 
             logger.i { "⭐ Priority ${idx + 1}/${entries.size}: processing $bookFileName under categories ${categories.joinToString("/")}" }
-            createAndProcessBook(bookPath, parentId, metadata)
+            createAndProcessBook(bookPath, parentId, metadata, isBaseBook = true)
 
             // Mark as processed to avoid double insertion during full traversal
             processedPriorityBookKeys.add(key)
@@ -875,6 +1012,45 @@ class DatabaseGenerator(
         } catch (_: Exception) {
             // Fallback to filename
             file.fileName.toString()
+        }
+    }
+
+    // Resolve a source id for a book file using the manifest mapping
+    private suspend fun resolveSourceIdFor(file: Path): Long {
+        val rel = toLibraryRelativeKey(file)
+        val sourceName = manifestSourcesByRel[rel] ?: "Unknown"
+        val cached = sourceNameToId[sourceName]
+        if (cached != null) return cached
+        val id = repository.insertSource(sourceName)
+        sourceNameToId[sourceName] = id
+        return id
+    }
+
+    private fun getSourceNameFor(file: Path): String {
+        val rel = toLibraryRelativeKey(file)
+        return manifestSourcesByRel[rel] ?: "Unknown"
+    }
+
+    private fun loadSourceBlacklistFromResources(): Set<String> {
+        val fallback = setOf("wiki_jewish_books")
+        return try {
+            val resourceNames = listOf("source-blacklist.txt", "/source-blacklist.txt")
+            val cl = Thread.currentThread().contextClassLoader
+            val stream = resourceNames.asSequence()
+                .mapNotNull { name ->
+                    cl?.getResourceAsStream(name) ?: DatabaseGenerator::class.java.getResourceAsStream(name)
+                }
+                .firstOrNull()
+            if (stream == null) return fallback
+            stream.bufferedReader(Charsets.UTF_8).use { br ->
+                br.lineSequence()
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() && !it.startsWith("#") }
+                    .toSet()
+            }.ifEmpty { fallback }
+        } catch (e: Exception) {
+            Logger.withTag("DatabaseGenerator").w(e) { "Failed to load source-blacklist.txt; using fallback" }
+            fallback
         }
     }
 
@@ -903,7 +1079,7 @@ class DatabaseGenerator(
                 async {
                     val bookTitle = file.nameWithoutExtension.removeSuffix("_links")
                     val content = file.readText()
-                    val links = json.decodeFromString<List<LinkData>>(content)
+                    val links = parseLinksFromJson(content, bookTitle)
                     bookTitle to links
                 }
             }.mapNotNull { deferred ->
@@ -954,7 +1130,7 @@ class DatabaseGenerator(
         try {
             val content = linkFile.readText()
             logger.d { "Link file content length: ${content.length}" }
-            val links = json.decodeFromString<List<LinkData>>(content)
+            val links = parseLinksFromJson(content, bookTitle)
             logger.d { "Decoded ${links.size} links from file" }
             var processed = 0
 
@@ -1249,6 +1425,31 @@ class DatabaseGenerator(
 
 
 
+    /**
+     * Parses links from JSON content, handling both Ben-YehudaToOtzaria and DictaToOtzaria formats
+     */
+    private fun parseLinksFromJson(content: String, bookTitle: String): List<LinkData> {
+        return try {
+            // First, try to parse as Ben-YehudaToOtzaria format (List<LinkData>)
+            json.decodeFromString<List<LinkData>>(content)
+        } catch (e: Exception) {
+            // If that fails, try to parse as DictaToOtzaria format (Map<String, List<DictaLinkData>>)
+            try {
+                val dictaLinksMap = json.decodeFromString<Map<String, List<DictaLinkData>>>(content)
+                logger.d { "Successfully parsed DictaToOtzaria format for $bookTitle with ${dictaLinksMap.size} line groups" }
+                
+                // Convert DictaToOtzaria format to LinkData format
+                // Note: DictaToOtzaria format doesn't map perfectly to LinkData structure
+                // We'll need to handle this conversion carefully or skip for now
+                logger.w { "DictaToOtzaria format conversion not yet implemented for $bookTitle" }
+                emptyList<LinkData>()
+            } catch (e2: Exception) {
+                logger.w(e2) { "Failed to parse links from file for $bookTitle in any known format" }
+                emptyList<LinkData>()
+            }
+        }
+    }
+
     // Internal classes
 
     /**
@@ -1264,4 +1465,15 @@ class DatabaseGenerator(
         @SerialName("Conection Type")
         val connectionType: String = ""
     )
+
+    /**
+     * Data class for DictaToOtzaria link format
+     */
+    @Serializable
+    private data class DictaLinkData(
+        val start: Int,
+        val end: Int,
+        val refs: Map<String, String>
+    )
+
 }

@@ -10,6 +10,7 @@ import io.github.kdroidfilter.seforimlibrary.core.models.PubDate
 import io.github.kdroidfilter.seforimlibrary.core.models.PubPlace
 import io.github.kdroidfilter.seforimlibrary.core.models.SearchResult
 import io.github.kdroidfilter.seforimlibrary.core.models.TocEntry
+import io.github.kdroidfilter.seforimlibrary.core.models.Source
 import io.github.kdroidfilter.seforimlibrary.core.models.Topic
 // Legacy FTS result types removed (Lucene now used at app layer)
 import kotlinx.serialization.json.Json
@@ -72,19 +73,32 @@ fun io.github.kdroidfilter.seforimlibrary.db.Book.toModel(json: Json, authors: L
     return Book(
         id = id,
         categoryId = categoryId,
+        sourceId = sourceId,
         title = title,
         authors = authors,
         topics = emptyList(),
         pubPlaces = pubPlaces,
         pubDates = pubDates,
         heShortDesc = heShortDesc,
+        notesContent = notesContent,
         order = orderIndex.toFloat(),
         totalLines = totalLines.toInt(),
+        isBaseBook = isBaseBook == 1L,
         hasTargumConnection = hasTargumConnection == 1L,
         hasReferenceConnection = hasReferenceConnection == 1L,
         hasCommentaryConnection = hasCommentaryConnection == 1L,
         hasOtherConnection = hasOtherConnection == 1L
 
+    )
+}
+
+/**
+ * Converts a database Source entity to a domain Source model.
+ */
+fun io.github.kdroidfilter.seforimlibrary.db.Source.toModel(): Source {
+    return Source(
+        id = id,
+        name = name
     )
 }
 
